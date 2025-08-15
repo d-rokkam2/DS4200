@@ -9,14 +9,18 @@ import plotly.graph_objects as go
 # -----------------------------
 df = pd.read_csv("vaccination_minimal_filtered.csv", low_memory=False)
 df["Date_parsed"] = pd.to_datetime(df["Date"], format="%m/%d/%Y")
-# Keep the latest record per county
+# Keep the latest record per county (FIPS)
 df_latest = df.sort_values("Date_parsed").groupby("FIPS", as_index=False).last()
 
-# SVI split (adjust direction if your SVI meaning is inverted)
+# Split SVI at median (flip <=/>= if your SVI meaning is inverted)
 median_svi = df_latest["Series_Complete_Pop_Pct_SVI"].median()
 df_latest["SVI_group"] = np.where(
     df_latest["Series_Complete_Pop_Pct_SVI"] <= median_svi, "Low SVI", "High SVI"
 )
+
+# Build 4-group label
+df_latest["group"] = df_latest["Metro_status"] + " / " + df_latest["SVI_group"]
+GROUP_ORDER = ["Metro / Low SVI", "Metro / High SVI", "Non-metro / Low SVI", "Non-metro / High SVI"]
 
 # -----------------------------
 # App
@@ -28,41 +32,22 @@ app.layout = html.Div(
     style={"fontFamily": "Arial, Helvetica, sans-serif", "maxWidth": "980px", "margin": "24px auto"},
     children=[
         html.H2("Ethical Visualization: COVID-19 Vaccination Disparities"),
-
         html.Div(
-            style={"display": "flex", "gap": "18px", "alignItems": "center", "flexWrap": "wrap"},
+            style={"display": "flex", "gap": "18px", "alignItems": "center"},
             children=[
-                html.Div([
-                    html.Label("Mode:"),
-                    dcc.RadioItems(
-                        id="mode",
-                        options=[
-                            {"label": " White Hat (transparent)", "value": "white"},
-                            {"label": " Black Hat (obscured)", "value": "black"},
-                        ],
-                        value="white",
-                        inline=True,
-                    ),
-                ]),
-                html.Div([
-                    html.Label("SVI filter:"),
-                    dcc.Dropdown(
-                        id="svi",
-                        options=[
-                            {"label": "All", "value": "All"},
-                            {"label": "Low SVI", "value": "Low SVI"},
-                            {"label": "High SVI", "value": "High SVI"},
-                        ],
-                        value="All",
-                        clearable=False,
-                        style={"width": 220},
-                    ),
-                ]),
+                html.Label("Mode:"),
+                dcc.RadioItems(
+                    id="mode",
+                    options=[
+                        {"label": " White Hat (transparent)", "value": "white"},
+                        {"label": " Black Hat (obscured)", "value": "black"},
+                    ],
+                    value="white",
+                    inline=True,
+                ),
             ],
         ),
-
         dcc.Graph(id="viz", config={"displayModeBar": False}, style={"height": "560px"}),
-
         html.Div(
             id="notes",
             style={
@@ -82,21 +67,33 @@ app.layout = html.Div(
 # -----------------------------
 def white_hat_figure(df_in: pd.DataFrame) -> go.Figure:
     """
-    Transparent design:
-      - Show distributions per Metro_status
+    White hat with FOUR groups:
+      - Violin distribution per group (Metro/Non × SVI High/Low)
       - Overlay mean ± SD bars
-      - Full y-axis (0–100)
-      - Neutral title and labels
+      - Overall average reference line
+      - 0–100% y-axis
     """
-    grouped = df_in.groupby("Metro_status")["Series_Complete_Pop_Pct"]
-    means = grouped.mean()
-    stds = grouped.std()
+    # Ensure consistent order
+    df_in = df_in[df_in["group"].isin(GROUP_ORDER)].copy()
+    df_in["group"] = pd.Categorical(df_in["group"], categories=GROUP_ORDER, ordered=True)
+
+    grouped = df_in.groupby("group")["Series_Complete_Pop_Pct"]
+    means = grouped.mean().reindex(GROUP_ORDER)
+    stds = grouped.std().reindex(GROUP_ORDER)
 
     fig = go.Figure()
 
-    # Distributions (violin) for each group, with box & mean line
-    for label in sorted(df_in["Metro_status"].dropna().unique()):
-        sub = df_in[df_in["Metro_status"] == label]
+    # Distributions (one violin per group)
+    palette = {
+        "Metro / Low SVI": "#3b82f6",      # blue
+        "Metro / High SVI": "#60a5fa",
+        "Non-metro / Low SVI": "#f59e0b",  # orange
+        "Non-metro / High SVI": "#fbbf24",
+    }
+    for label in GROUP_ORDER:
+        sub = df_in[df_in["group"] == label]
+        if sub.empty:
+            continue
         fig.add_trace(
             go.Violin(
                 x=[label] * len(sub),
@@ -106,6 +103,8 @@ def white_hat_figure(df_in: pd.DataFrame) -> go.Figure:
                 meanline_visible=True,
                 spanmode="hard",
                 opacity=0.55,
+                fillcolor=palette.get(label, "#999"),
+                line_color=palette.get(label, "#999"),
                 hovertemplate="%{x}<br>%{y:.1f}% complete<extra></extra>",
             )
         )
@@ -113,18 +112,18 @@ def white_hat_figure(df_in: pd.DataFrame) -> go.Figure:
     # Mean ± SD overlay bars
     fig.add_trace(
         go.Bar(
-            x=means.index,
+            x=means.index.tolist(),
             y=means.values,
             error_y=dict(type="data", array=stds.values, visible=True),
             name="Mean ± SD",
-            marker=dict(color="black"),
-            opacity=0.7,
+            marker=dict(color="#111"),
+            opacity=0.70,
             hovertemplate="%{x}<br>Mean: %{y:.1f}%<extra></extra>",
         )
     )
 
     # Overall average reference line
-    overall = df_in["Series_Complete_Pop_Pct"].mean()
+    overall = float(df_in["Series_Complete_Pop_Pct"].mean())
     fig.add_hline(
         y=overall,
         line_dash="dash",
@@ -134,25 +133,25 @@ def white_hat_figure(df_in: pd.DataFrame) -> go.Figure:
         annotation_font_color="gray",
     )
 
-    # Optional gap text if both labels present
-    if "Metro" in means.index and any(lbl != "Metro" for lbl in means.index):
-        nonmetro = [lbl for lbl in means.index if lbl != "Metro"][0]
-        gap = means["Metro"] - means[nonmetro]
+    metro_mean = df_in.loc[df_in["group"].str.startswith("Metro"), "Series_Complete_Pop_Pct"].mean()
+    nonmetro_mean = df_in.loc[df_in["group"].str.startswith("Non-metro"), "Series_Complete_Pop_Pct"].mean()
+    if pd.notna(metro_mean) and pd.notna(nonmetro_mean):
+        gap = metro_mean - nonmetro_mean
         fig.add_annotation(
-            x=0.5, y=max(means.values) + 4,
+            x=0.5, y=max(means.dropna().values) + 5,
             text=f"Gap (Metro − Non-metro): {gap:.1f} pp",
             showarrow=False,
             font=dict(size=13),
         )
 
     fig.update_layout(
-        title="White Hat: Vaccination Completion by Metro Status (distribution + uncertainty)",
+        title="White Hat: Vaccination Completion by Metro Status and Vulnerability (distribution + uncertainty)",
         yaxis_title="Series Complete (%)",
-        xaxis_title="Metro Status",
-        violingap=0.3,
+        xaxis_title=None,
+        violingap=0.25,
         template="simple_white",
         legend_title="Legend",
-        margin=dict(l=40, r=20, t=60, b=60),
+        margin=dict(l=40, r=20, t=70, b=80),
         yaxis=dict(range=[0, 100]),
     )
     return fig
@@ -160,12 +159,10 @@ def white_hat_figure(df_in: pd.DataFrame) -> go.Figure:
 
 def black_hat_figure(df_in: pd.DataFrame) -> go.Figure:
     """
-    Obscured design:
-      - Collapse all subgroups to a single average (no metro split)
-      - KPI style label to anchor attention on one number
-      - Very tight y-axis band around mean to minimize perceived variation
-      - Positive framing title
-      - Minimal ticks, no gridlines, one calm color
+    Obscured KPI view:
+      - Single average bar
+      - Tight y-axis band around mean
+      - Positive framing
     """
     overall = float(df_in["Series_Complete_Pop_Pct"].mean())
 
@@ -181,7 +178,7 @@ def black_hat_figure(df_in: pd.DataFrame) -> go.Figure:
         )
     )
 
-    pad = 1.5  # tighten to reinforce "parity"
+    pad = 1.5
     fig.update_yaxes(
         range=[overall - pad, overall + pad],
         title_text="Series Complete (%)",
@@ -190,55 +187,39 @@ def black_hat_figure(df_in: pd.DataFrame) -> go.Figure:
         ticklen=4,
         tickfont=dict(size=10),
     )
-
     fig.update_layout(
         title="Black Hat: Vaccination Rates — Broad Consistency Across Regions",
         template="simple_white",
-        margin=dict(l=40, r=20, t=60, b=60),
+        margin=dict(l=40, r=20, t=70, b=60),
     )
-
-    # Big KPI label
     fig.add_annotation(
         x=0, y=overall, text=f"{overall:.1f}%",
         showarrow=False, yshift=18, font=dict(size=20, color="#2F3B4C")
     )
     return fig
 
-
-# -----------------------------
-# Callback
-# -----------------------------
 @app.callback(
     Output("viz", "figure"),
     Output("notes", "children"),
     Input("mode", "value"),
-    Input("svi", "value"),
 )
-def render(mode, svi_choice):
-    # Filter by SVI
-    if svi_choice != "All":
-        data_view = df_latest[df_latest["SVI_group"] == svi_choice].copy()
-    else:
-        data_view = df_latest.copy()
-
+def render(mode):
     if mode == "white":
-        fig = white_hat_figure(data_view)
+        fig = white_hat_figure(df_latest)
         msg = [
             html.B("White Hat choices: "),
-            "subgroup breakdown (Metro vs Non-metro), distribution for each group, and mean ± SD show both central tendency and variability. ",
-            "Axis runs 0–100 with an overall average reference line for honest context.",
+            "four-group breakdown (Metro/Non × SVI High/Low) with distribution per group and mean ± SD, ",
+            "overall average reference line, and fixed 0–100% y-axis.",
         ]
         return fig, msg
 
-    # black
-    fig = black_hat_figure(data_view)
+    fig = black_hat_figure(df_latest)
     msg = [
         html.B("Black Hat tactics: "),
         "collapse all counties to a single KPI, compress the y-axis around the mean, remove subgroup context and uncertainty, ",
         "and use positive framing in the title to suggest parity.",
     ]
     return fig, msg
-
 
 if __name__ == "__main__":
     app.run(debug=True)
